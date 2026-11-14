@@ -43,8 +43,18 @@ public class PlayerController : MonoBehaviour
 
     [Header("벽타기")]
     public float wallSlideSpeed = 2f;
+    [Tooltip("벽 쪽(또는 무입력)으로 점프: 벽에서 살짝 떨어지는 수평 속도")]
     public float wallJumpHorizontalSpeed = 6f;
+    [Tooltip("벽 쪽 점프: 떨어지는 시간 (이후 자동으로 다시 벽으로 붙음)")]
     public float wallJumpInputLockTime = 0.15f;
+    [Tooltip("벽 쪽 점프: 다시 벽으로 돌아가는 최대 시간")]
+    public float wallJumpReturnTime = 0.25f;
+    [Tooltip("벽 반대 방향키 + 점프: 그 방향으로 뛰어나가는 수평 속도")]
+    public float wallJumpAwaySpeed = 8f;
+    [Tooltip("벽 반대 방향 점프 직후 입력을 무시하는 시간")]
+    public float wallJumpAwayLockTime = 0.1f;
+    [Tooltip("켜면 벽에 매달린 상태에서 S로 벽을 놓음 (기본: 끔 → 방향키로는 벽에서 떨어지지 않음)")]
+    public bool releaseWallWithDown = false;
 
     [Header("웅크리기")]
     [Tooltip("공중에서 웅크림이 강제로 풀리기까지 필요한 체공 시간 (+ 머리 위 2m 공간 필요)")]
@@ -71,8 +81,9 @@ public class PlayerController : MonoBehaviour
     public bool IsGrounded { get; private set; }
     public bool IsCrouching { get; private set; }
     public bool IsDashing { get; private set; }
-    public bool IsWallSliding { get; private set; }
+    public bool IsWallSliding { get; private set; }     // 벽에 매달려 미끄러지는 중
     public bool IsInUpdraft { get; private set; }
+    public bool IsBeingPulled { get; private set; }
     public bool IsDead { get; private set; }
     public float CurrentHeight => IsCrouching ? crouchHeight : standHeight;
     public float DashCooldownRemaining => Mathf.Max(0f, dashCooldownTimer);
@@ -94,6 +105,12 @@ public class PlayerController : MonoBehaviour
     // 타이머
     float coyoteTimer, timeSinceGrounded, dashTimer, dashCooldownTimer;
     float wallJumpLockTimer, hitStunTimer, dropTimer;
+    float wallReturnTimer;
+    int wallReturnDir;
+    int wallClingDir;               // 매달린 벽 방향 (-1 왼쪽, 1 오른쪽, 0 없음)
+    Vector2 appliedPull;            // 지난 스텝에 더한 끌림 속도 (다음 스텝에서 빼서 누적 방지)
+    readonly Collider2D[] wallHits = new Collider2D[8];
+    ContactFilter2D wallFilter;
 
     bool doubleJumpAvailable = true;
     bool jumpCutAvailable;
@@ -173,12 +190,16 @@ public class PlayerController : MonoBehaviour
     }
 
     // ───────── 물리 ─────────
+    enum WallContact { None, Climbable, Slippery }
+
     void FixedUpdate()
     {
         float dt = Time.fixedDeltaTime;
         TickTimers(dt);
 
-        Vector2 v = rb.GetVelocity();
+        // 지난 스텝의 끌림 속도를 빼서 "플레이어 자신의 속도"만 남김
+        Vector2 v = rb.GetVelocity() - appliedPull;
+        appliedPull = Vector2.zero;
 
         if (trackingJump)
         {
@@ -190,9 +211,9 @@ public class PlayerController : MonoBehaviour
         bool groundedSolid = CheckSolidGround(v.y);
         Collider2D oneWay = v.y > 0.1f ? null : ProbeOneWay();
         IsGrounded = groundedSolid || oneWay != null;
-        bool wallLeft = CheckWall(-1);
-        bool wallRight = CheckWall(1);
-        int touchingWall = wallRight ? 1 : (wallLeft ? -1 : 0);
+        WallContact wallLeft = CheckWall(-1);
+        WallContact wallRight = CheckWall(1);
+        int climbWall = wallRight == WallContact.Climbable ? 1 : (wallLeft == WallContact.Climbable ? -1 : 0);
 
         if (IsGrounded)
         {
@@ -209,15 +230,15 @@ public class PlayerController : MonoBehaviour
             v.y = Mathf.Max(v.y, -maxFallSpeed);
             rb.SetVelocity(v);
             dashRequested = false;
-            IsWallSliding = false;
+            ReleaseWall();
             return;
         }
 
-        // 3. 대쉬 진행 중
+        // 3. 대쉬 진행 중 (붙을 수 없는 벽 포함, 어떤 벽이든 막히면 종료)
         if (IsDashing)
         {
             dashTimer -= dt;
-            bool blocked = dashDir > 0 ? wallRight : wallLeft;
+            bool blocked = (dashDir > 0 ? wallRight : wallLeft) != WallContact.None;
             if (dashTimer > 0f && !blocked)
             {
                 rb.SetVelocity(new Vector2(dashDir * dashSpeed, 0f));
@@ -240,29 +261,54 @@ public class PlayerController : MonoBehaviour
             v.y = Mathf.Min(v.y, -2f);
         }
 
-        // 6. 수평 이동
-        if (wallJumpLockTimer <= 0f)
+        // 6. 벽 매달리기 상태 갱신
+        bool wallAbility = GameManager.HasWallJump && !IsGrounded;
+        if (wallClingDir != 0)
         {
-            v.x = moveInput * (IsCrouching ? crouchMoveSpeed : moveSpeed);
-            if (moveInput != 0f) Facing = moveInput > 0f ? 1 : -1;
+            WallContact w = wallClingDir > 0 ? wallRight : wallLeft;
+            if (!wallAbility || w != WallContact.Climbable || (releaseWallWithDown && downHeld))
+                ReleaseWall();
         }
+        if (wallClingDir == 0 && wallAbility && climbWall != 0 && v.y <= 0f)
+        {
+            wallClingDir = climbWall;            // 떨어지는 중 벽에 닿으면 매달림
+            wallReturnTimer = 0f;
+        }
+        IsWallSliding = wallClingDir != 0;
 
-        // 7. 벽 슬라이드
-        bool canWallJump = GameManager.HasWallJump && !IsGrounded && touchingWall != 0;
-        IsWallSliding = canWallJump && v.y <= 0f;
+        // 7. 수평 이동
         if (IsWallSliding)
         {
+            // 매달린 동안 방향키는 무시: 벽에 밀착한 채 미끄러지기만 함
+            v.x = wallClingDir * 1f;
             v.y = Mathf.Max(v.y, -wallSlideSpeed);
+            Facing = wallClingDir;               // 벽을 바라봄
             doubleJumpAvailable = true;          // 벽에 붙음 → 더블점프 재충전
-            Facing = -touchingWall;              // 벽 반대쪽을 바라봄
+        }
+        else if (wallJumpLockTimer <= 0f)
+        {
+            bool returning = wallReturnTimer > 0f;
+            if (returning && moveInput != 0f && Mathf.Sign(moveInput) == -wallReturnDir) { wallReturnTimer = 0f; returning = false; }
+            if (returning && climbWall == wallReturnDir) { wallReturnTimer = 0f; returning = false; }
+
+            if (returning)
+            {
+                v.x = wallReturnDir * moveSpeed; // 벽 쪽 점프 후 자동으로 다시 벽으로
+            }
+            else
+            {
+                v.x = moveInput * (IsCrouching ? crouchMoveSpeed : moveSpeed);
+                if (moveInput != 0f) Facing = moveInput > 0f ? 1 : -1;
+            }
         }
 
-        // 8. 대쉬 시작
+        // 8. 대쉬 시작 (매달린 상태면 벽 반대쪽으로)
         if (dashRequested && GameManager.HasDash && !IsCrouching && dashCooldownTimer <= 0f)
         {
             dashRequested = false;
-            int dir = IsWallSliding ? -touchingWall
+            int dir = IsWallSliding ? -wallClingDir
                     : (moveInput != 0f ? (moveInput > 0f ? 1 : -1) : Facing);
+            ReleaseWall();
             StartDash(dir);
             rb.SetVelocity(new Vector2(dashDir * dashSpeed, 0f));
             return;
@@ -271,6 +317,7 @@ public class PlayerController : MonoBehaviour
 
         // 9. 점프 (지면 → 벽 → 더블 순서)
         float jv = IsCrouching ? crouchJumpVelocity : jumpVelocity;
+        int jumpWall = IsWallSliding ? wallClingDir : (wallAbility ? climbWall : 0);
         if (jumpBufferTimer > 0f)
         {
             if (coyoteTimer > 0f)
@@ -278,13 +325,28 @@ public class PlayerController : MonoBehaviour
                 DoJump(ref v, jv);
                 coyoteTimer = 0f;
             }
-            else if (canWallJump)
+            else if (jumpWall != 0)
             {
                 DoJump(ref v, jv);
-                v.x = -touchingWall * wallJumpHorizontalSpeed;
-                Facing = -touchingWall;
-                wallJumpLockTimer = wallJumpInputLockTime;
-                IsWallSliding = false;
+                bool away = moveInput != 0f && Mathf.Sign(moveInput) == -jumpWall;
+                if (away)
+                {
+                    // 벽 반대 방향키 + 점프 → 그 방향을 바라보며 뛰어나감
+                    v.x = -jumpWall * wallJumpAwaySpeed;
+                    Facing = -jumpWall;
+                    wallJumpLockTimer = wallJumpAwayLockTime;
+                    wallReturnTimer = 0f;
+                }
+                else
+                {
+                    // 벽 쪽 / 무입력 + 점프 → 살짝 떨어졌다가 다시 벽에 붙으며 상승
+                    v.x = -jumpWall * wallJumpHorizontalSpeed;
+                    Facing = jumpWall;
+                    wallJumpLockTimer = wallJumpInputLockTime;
+                    wallReturnTimer = wallJumpInputLockTime + wallJumpReturnTime;
+                    wallReturnDir = jumpWall;
+                }
+                ReleaseWall();
             }
             else if (GameManager.HasDoubleJump && doubleJumpAvailable)
             {
@@ -310,7 +372,20 @@ public class PlayerController : MonoBehaviour
         }
 
         v.y = Mathf.Max(v.y, -maxFallSpeed);
-        rb.SetVelocity(v);
+
+        // 11. 끌림 기믹: 자신의 속도에 끌림 속도를 더함 (바닥에서는 위로 띄우지 않음)
+        Vector2 pull = PullTilemap.GetPull(rb.position + Vector2.up * (CurrentHeight * 0.5f));
+        if (IsGrounded && pull.y > 0f) pull.y = 0f;
+        IsBeingPulled = pull != Vector2.zero;
+        appliedPull = pull;
+
+        rb.SetVelocity(v + pull);
+    }
+
+    void ReleaseWall()
+    {
+        wallClingDir = 0;
+        IsWallSliding = false;
     }
 
     void TickTimers(float dt)
@@ -319,6 +394,7 @@ public class PlayerController : MonoBehaviour
         coyoteTimer -= dt;
         dashCooldownTimer -= dt;
         wallJumpLockTimer -= dt;
+        wallReturnTimer -= dt;
         hitStunTimer -= dt;
         if (dropTimer > 0f)
         {
@@ -358,11 +434,22 @@ public class PlayerController : MonoBehaviour
         return null;
     }
 
-    bool CheckWall(int dir)
+    /// <summary>dir 방향 벽 감지. WallSurface.climbable = false인 벽만 있으면 Slippery</summary>
+    WallContact CheckWall(int dir)
     {
         float h = CurrentHeight;
         Vector2 center = rb.position + new Vector2(dir * (width * 0.5f + 0.05f), h * 0.5f);
-        return Physics2D.OverlapBox(center, new Vector2(0.1f, h * 0.7f), 0f, groundMask) != null;
+        wallFilter.useLayerMask = true;
+        wallFilter.layerMask = groundMask;
+        wallFilter.useTriggers = false;
+        int n = Physics2D.OverlapBox(center, new Vector2(0.1f, h * 0.7f), 0f, wallFilter, wallHits);
+        if (n == 0) return WallContact.None;
+        for (int i = 0; i < n; i++)
+        {
+            WallSurface ws = wallHits[i].GetComponent<WallSurface>();
+            if (ws == null || ws.climbable) return WallContact.Climbable;
+        }
+        return WallContact.Slippery;
     }
 
     /// <summary>웅크린 상태에서 일어설 공간(머리 위 standHeight까지)이 있는지</summary>
@@ -457,6 +544,9 @@ public class PlayerController : MonoBehaviour
         rb.SetVelocity(new Vector2(dir * knockbackVelocity.x, knockbackVelocity.y));
         hitStunTimer = hitStunTime;
         wallJumpLockTimer = 0f;
+        wallReturnTimer = 0f;
+        appliedPull = Vector2.zero;
+        ReleaseWall();
         jumpCutAvailable = false;
     }
 
@@ -469,6 +559,22 @@ public class PlayerController : MonoBehaviour
     }
 
     void RespawnAtStart() => Respawn(spawnPoint);
+
+    /// <summary>체력 변화 없이 위치만 옮김 (저장 지점 순간이동 등)</summary>
+    public void TeleportTo(Vector2 position)
+    {
+        RestorePlatforms();
+        if (IsDashing) EndDash();
+        ReleaseWall();
+        rb.position = position;
+        transform.position = position;
+        rb.SetVelocity(Vector2.zero);
+        appliedPull = Vector2.zero;
+        wallJumpLockTimer = 0f;
+        wallReturnTimer = 0f;
+        hitStunTimer = 0f;
+        if (IsCrouching && HasHeadroom()) ApplyCrouchShape(false);
+    }
 
     public void Respawn(Vector2 position)
     {
@@ -483,6 +589,9 @@ public class PlayerController : MonoBehaviour
         dashCooldownTimer = 0f;
         wallJumpLockTimer = 0f;
         doubleJumpAvailable = true;
+        wallReturnTimer = 0f;
+        appliedPull = Vector2.zero;
+        ReleaseWall();
         Health.ResetHealth();
     }
 
@@ -491,9 +600,10 @@ public class PlayerController : MonoBehaviour
         get
         {
             if (IsDead) return "사망";
-            string s = IsDashing ? "대쉬" : IsWallSliding ? "벽 슬라이드" : IsGrounded ? "지면" : "공중";
+            string s = IsDashing ? "대쉬" : IsWallSliding ? "벽 매달림" : IsGrounded ? "지면" : "공중";
             if (IsCrouching) s += " / 웅크림";
             if (IsInUpdraft) s += " / 상승기류";
+            if (IsBeingPulled) s += " / 끌림";
             if (!IsGrounded && !IsDashing) s += doubleJumpAvailable && GameManager.HasDoubleJump ? " (더블점프 가능)" : "";
             return s;
         }

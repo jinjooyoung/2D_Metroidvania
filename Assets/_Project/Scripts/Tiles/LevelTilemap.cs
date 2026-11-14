@@ -3,7 +3,7 @@ using UnityEngine.Tilemaps;
 
 /// <summary>
 /// 레벨 디자인용 단일 타일맵.
-/// 여기에 바닥/발판/가시/상승기류/저장지점을 전부 그리면,
+/// 여기에 바닥/발판/가시/상승기류/저장지점/붙을 수 없는 벽/끌림을 전부 그리면,
 /// 타일 종류를 보고 [자동] 충돌·기능 레이어로 분배(동기화)함.
 /// 등록되지 않은 타일은 장식(충돌 없음)으로 취급.
 /// </summary>
@@ -16,6 +16,8 @@ public class LevelTilemap : MonoBehaviour
     public TileBase[] spikeTiles;       // 가시 함정
     public TileBase[] updraftTiles;     // 상승기류
     public TileBase[] savePointTiles;   // 저장 지점
+    public TileBase[] noClimbTiles;     // 붙을 수 없는 벽
+    public TileBase[] pullTiles;        // 끌림 기믹
 
     [Header("[자동] 레이어 - 여기에 직접 그려도 Level로 옮겨짐")]
     public Tilemap solidLayer;
@@ -23,6 +25,8 @@ public class LevelTilemap : MonoBehaviour
     public Tilemap spikeLayer;
     public Tilemap updraftLayer;
     public Tilemap savePointLayer;
+    public Tilemap noClimbLayer;
+    public Tilemap pullLayer;
 
     Tilemap source;
     public Tilemap Source => source != null ? source : (source = GetComponent<Tilemap>());
@@ -37,6 +41,8 @@ public class LevelTilemap : MonoBehaviour
         SyncLayer(spikeLayer, spikeTiles);
         SyncLayer(updraftLayer, updraftTiles);
         SyncLayer(savePointLayer, savePointTiles);
+        SyncLayer(noClimbLayer, noClimbTiles);
+        SyncLayer(pullLayer, pullTiles);
     }
 
     void SyncLayer(Tilemap dst, TileBase[] kinds)
@@ -65,7 +71,8 @@ public class LevelTilemap : MonoBehaviour
     }
 
     public bool IsGeneratedLayer(Tilemap tm) =>
-        tm != null && (tm == solidLayer || tm == oneWayLayer || tm == spikeLayer || tm == updraftLayer || tm == savePointLayer);
+        tm != null && (tm == solidLayer || tm == oneWayLayer || tm == spikeLayer || tm == updraftLayer || tm == savePointLayer
+                       || tm == noClimbLayer || tm == pullLayer);
 
     public TileBase[] KindsOf(Tilemap layer)
     {
@@ -74,6 +81,8 @@ public class LevelTilemap : MonoBehaviour
         if (layer == spikeLayer) return spikeTiles;
         if (layer == updraftLayer) return updraftTiles;
         if (layer == savePointLayer) return savePointTiles;
+        if (layer == noClimbLayer) return noClimbTiles;
+        if (layer == pullLayer) return pullTiles;
         return null;
     }
 }

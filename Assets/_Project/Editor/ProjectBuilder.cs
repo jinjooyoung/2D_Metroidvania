@@ -1,5 +1,6 @@
 #if UNITY_EDITOR
 using System;
+using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -29,12 +30,14 @@ public static class ProjectBuilder
     static readonly Color PlatformColor  = Hex("C8A064");          // 통과 발판
     static readonly Color SpikeColor     = Hex("FF4D8D");          // 가시 함정
     static readonly Color UpdraftColor   = Hex("5FD8FF", 0.45f);   // 상승기류
-    static readonly Color SaveColor      = Hex("4BE07A", 0.85f);   // 저장 지점
+    static readonly Color SaveColor      = Hex("FFFFFF", 0.9f);    // 저장 지점 (미방문 = 흰색, 방문 시 런타임에서 초록)
+    static readonly Color NoClimbColor   = Hex("33363F");          // 붙을 수 없는 벽 (벽보다 어두움)
+    static readonly Color PullColor      = Hex("C8A2FF");          // 끌림 기믹 (연보라)
     static readonly Color PlayerColor    = Hex("3D8BFF");
     static readonly Color EnemyColor     = Hex("E8483B");
     static readonly Color BackgroundColor = Hex("1B1E26");
 
-    internal class TileSet { public Tile ground, platform, spike, updraft, savePoint; }
+    internal class TileSet { public Tile ground, platform, spike, updraft, savePoint, noClimb, pull; }
 
     static TileSet LoadTileSet()
     {
@@ -45,6 +48,8 @@ public static class ProjectBuilder
             spike     = AssetDatabase.LoadAssetAtPath<Tile>(TileDir + "/T_Spike.asset"),
             updraft   = AssetDatabase.LoadAssetAtPath<Tile>(TileDir + "/T_Updraft.asset"),
             savePoint = AssetDatabase.LoadAssetAtPath<Tile>(TileDir + "/T_SavePoint.asset"),
+            noClimb   = AssetDatabase.LoadAssetAtPath<Tile>(TileDir + "/T_WallNoClimb.asset"),
+            pull      = AssetDatabase.LoadAssetAtPath<Tile>(TileDir + "/T_Pull.asset"),
         };
     }
 
@@ -179,11 +184,13 @@ public static class ProjectBuilder
             platform  = CreateTile("T_Platform",  platform, PlatformColor, Tile.ColliderType.Sprite),
             spike     = CreateTile("T_Spike",     square,   SpikeColor,    Tile.ColliderType.Grid),
             updraft   = CreateTile("T_Updraft",   square,   UpdraftColor,  Tile.ColliderType.None),
-            savePoint = CreateTile("T_SavePoint", square,   SaveColor,     Tile.ColliderType.Grid),
+            savePoint = CreateTile("T_SavePoint", square,   SaveColor,     Tile.ColliderType.Grid, TileFlags.None),
+            noClimb   = CreateTile("T_WallNoClimb", square, NoClimbColor,  Tile.ColliderType.Grid),
+            pull      = CreateTile("T_Pull",      square,   PullColor,     Tile.ColliderType.None),
         };
     }
 
-    static Tile CreateTile(string name, Sprite sprite, Color color, Tile.ColliderType colliderType)
+    static Tile CreateTile(string name, Sprite sprite, Color color, Tile.ColliderType colliderType, TileFlags flags = TileFlags.LockColor)
     {
         string path = $"{TileDir}/{name}.asset";
         Tile t = AssetDatabase.LoadAssetAtPath<Tile>(path);
@@ -195,12 +202,96 @@ public static class ProjectBuilder
         t.sprite = sprite;
         t.color = color;
         t.colliderType = colliderType;
-        t.flags = TileFlags.LockColor;
+        t.flags = flags;   // 저장 지점은 런타임에 칸별 색을 바꾸므로 잠그지 않음
         EditorUtility.SetDirty(t);
         return t;
     }
 
+    /// <summary>Tiles 폴더의 팔레트를 찾아 빠진 타일만 추가. 팔레트가 하나도 없으면 새로 만듦</summary>
     static void CreatePalette(TileSet tiles)
+    {
+        List<string> palettes = FindPalettes();
+        if (palettes.Count > 0)
+        {
+            foreach (string pal in palettes) AddMissingTilesToPalette(pal, tiles);
+            return;
+        }
+        CreateNewPalette(tiles);
+    }
+
+    static Tile[] AllTiles(TileSet t) =>
+        new[] { t.ground, t.platform, t.spike, t.updraft, t.savePoint, t.noClimb, t.pull };
+
+    /// <summary>Tiles 폴더 안의 타일 팔레트 프리팹 경로 (GridPalette 하위 에셋이 있는 프리팹)</summary>
+    internal static List<string> FindPalettes()
+    {
+        var result = new List<string>();
+        foreach (string guid in AssetDatabase.FindAssets("t:Prefab", new[] { TileDir }))
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            foreach (Object o in AssetDatabase.LoadAllAssetsAtPath(path))
+                if (o != null && o.GetType().Name == "GridPalette") { result.Add(path); break; }
+        }
+        return result;
+    }
+
+    internal static bool PaletteMissingTiles(string path, TileSet t)
+    {
+        GameObject asset = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+        Tilemap tm = asset != null ? asset.GetComponentInChildren<Tilemap>() : null;
+        if (tm == null) return false;
+        foreach (Tile tile in AllTiles(t))
+            if (tile != null && !tm.ContainsTile(tile)) return true;
+        return false;
+    }
+
+    static void AddMissingTilesToPalette(string path, TileSet t)
+    {
+        if (!PaletteMissingTiles(path, t)) return;
+
+        // 팔레트 설정(GridPalette) 하위 에셋이 저장 중 사라지는 경우를 대비해 기억
+        bool hadSettings = HasPaletteSettings(path);
+
+        GameObject root = PrefabUtility.LoadPrefabContents(path);
+        try
+        {
+            Tilemap tm = root.GetComponentInChildren<Tilemap>();
+            if (tm == null) return;
+            tm.CompressBounds();
+            BoundsInt b = tm.cellBounds;
+            int x = b.size.x > 0 ? b.xMax : 0;
+            int y = b.size.y > 0 ? b.yMin : 0;
+            foreach (Tile tile in AllTiles(t))
+                if (tile != null && !tm.ContainsTile(tile)) tm.SetTile(new Vector3Int(x++, y, 0), tile);
+            tm.RefreshAllTiles();
+            PrefabUtility.SaveAsPrefabAsset(root, path);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(root); }
+
+        if (hadSettings && !HasPaletteSettings(path)) AddPaletteSettings(path);
+        Debug.Log("[ProjectBuilder] 팔레트에 새 타일 추가: " + path);
+    }
+
+    static bool HasPaletteSettings(string path)
+    {
+        foreach (Object o in AssetDatabase.LoadAllAssetsAtPath(path))
+            if (o != null && o.GetType().Name == "GridPalette") return true;
+        return false;
+    }
+
+    static void AddPaletteSettings(string path)
+    {
+        Type gpType = FindType("UnityEditor.GridPalette");
+        GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+        if (gpType == null || prefab == null) return;
+        ScriptableObject gp = ScriptableObject.CreateInstance(gpType);
+        gp.name = "Palette Settings";
+        AssetDatabase.AddObjectToAsset(gp, prefab);
+        AssetDatabase.SaveAssets();
+        AssetDatabase.ImportAsset(path);
+    }
+
+    static void CreateNewPalette(TileSet tiles)
     {
         string path = TileDir + "/LevelPalette.prefab";
         if (File.Exists(path)) AssetDatabase.DeleteAsset(path);
@@ -217,6 +308,8 @@ public static class ProjectBuilder
         tm.SetTile(new Vector3Int(2, 0, 0), tiles.spike);
         tm.SetTile(new Vector3Int(3, 0, 0), tiles.updraft);
         tm.SetTile(new Vector3Int(4, 0, 0), tiles.savePoint);
+        if (tiles.noClimb != null) tm.SetTile(new Vector3Int(5, 0, 0), tiles.noClimb);
+        if (tiles.pull != null) tm.SetTile(new Vector3Int(6, 0, 0), tiles.pull);
 
         GameObject prefab = PrefabUtility.SaveAsPrefabAsset(go, path);
         Object.DestroyImmediate(go);
@@ -409,44 +502,100 @@ public static class ProjectBuilder
     }
 
     /// <summary>[자동] 레이어 5개(렌더러 없음, 충돌/기능만)를 만들고 Level 타일맵과 연결</summary>
+    /// <summary>[자동] 레이어(렌더러 없음, 충돌/기능만)를 없는 것만 만들고 Level 타일맵과 연결</summary>
     static LevelTilemap SetupLevelLayers(Transform grid, Tilemap level, TileSet t)
     {
-        Tilemap solid = CreateTilemap(grid, "[자동] 충돌_벽바닥", "Ground", 0, false);
-        MakeSolid(solid.gameObject, false);
-
-        Tilemap oneWay = CreateTilemap(grid, "[자동] 충돌_발판", "OneWayPlatform", 0, false);
-        MakeSolid(oneWay.gameObject, true);
-
-        Tilemap spike = CreateTilemap(grid, "[자동] 충돌_가시", "Ground", 0, false);
-        MakeSolid(spike.gameObject, false);
-        DamageOnTouch dmg = spike.gameObject.AddComponent<DamageOnTouch>();
-        dmg.damage = 10;
-        dmg.targetMask = LayerMask.GetMask("Player");
-
-        Tilemap updraft = CreateTilemap(grid, "[자동] 상승기류", "Default", 0, false);
-        updraft.gameObject.AddComponent<UpdraftTilemap>();
-
-        Tilemap save = CreateTilemap(grid, "[자동] 저장지점", "Default", 0, false);
-        TilemapCollider2D saveCol = save.gameObject.AddComponent<TilemapCollider2D>();
-        saveCol.isTrigger = true;
-        save.gameObject.AddComponent<SavePointTilemap>();
-
         LevelTilemap lt = level.GetComponent<LevelTilemap>();
         if (lt == null) lt = level.gameObject.AddComponent<LevelTilemap>();
+
+        if (lt.solidLayer == null)
+        {
+            lt.solidLayer = CreateTilemap(grid, "[자동] 충돌_벽바닥", "Ground", 0, false);
+            MakeSolid(lt.solidLayer.gameObject, false);
+        }
+        if (lt.oneWayLayer == null)
+        {
+            lt.oneWayLayer = CreateTilemap(grid, "[자동] 충돌_발판", "OneWayPlatform", 0, false);
+            MakeSolid(lt.oneWayLayer.gameObject, true);
+        }
+        if (lt.spikeLayer == null)
+        {
+            lt.spikeLayer = CreateTilemap(grid, "[자동] 충돌_가시", "Ground", 0, false);
+            MakeSolid(lt.spikeLayer.gameObject, false);
+            DamageOnTouch dmg = lt.spikeLayer.gameObject.AddComponent<DamageOnTouch>();
+            dmg.damage = 10;
+            dmg.targetMask = LayerMask.GetMask("Player");
+        }
+        if (lt.updraftLayer == null)
+        {
+            lt.updraftLayer = CreateTilemap(grid, "[자동] 상승기류", "Default", 0, false);
+            lt.updraftLayer.gameObject.AddComponent<UpdraftTilemap>();
+        }
+        if (lt.savePointLayer == null)
+        {
+            lt.savePointLayer = CreateTilemap(grid, "[자동] 저장지점", "Default", 0, false);
+            TilemapCollider2D saveCol = lt.savePointLayer.gameObject.AddComponent<TilemapCollider2D>();
+            saveCol.isTrigger = true;
+            lt.savePointLayer.gameObject.AddComponent<SavePointTilemap>();
+        }
+        if (lt.noClimbLayer == null)
+        {
+            lt.noClimbLayer = CreateTilemap(grid, "[자동] 충돌_붙을수없는벽", "Ground", 0, false);
+            MakeSolid(lt.noClimbLayer.gameObject, false);
+            WallSurface ws = lt.noClimbLayer.gameObject.AddComponent<WallSurface>();
+            ws.climbable = false;
+        }
+        if (lt.pullLayer == null)
+        {
+            lt.pullLayer = CreateTilemap(grid, "[자동] 끌림", "Default", 0, false);
+            lt.pullLayer.gameObject.AddComponent<PullTilemap>();
+        }
+
         lt.solidTiles     = new TileBase[] { t.ground };
         lt.oneWayTiles    = new TileBase[] { t.platform };
         lt.spikeTiles     = new TileBase[] { t.spike };
         lt.updraftTiles   = new TileBase[] { t.updraft };
         lt.savePointTiles = new TileBase[] { t.savePoint };
-        lt.solidLayer = solid;
-        lt.oneWayLayer = oneWay;
-        lt.spikeLayer = spike;
-        lt.updraftLayer = updraft;
-        lt.savePointLayer = save;
+        lt.noClimbTiles   = new TileBase[] { t.noClimb };
+        lt.pullTiles      = new TileBase[] { t.pull };
 
         lt.Sync();
-        RefreshColliders(solid, oneWay, spike, save);
+        RefreshColliders(lt.solidLayer, lt.oneWayLayer, lt.spikeLayer, lt.savePointLayer, lt.noClimbLayer);
         return lt;
+    }
+
+    // ───────────────────────── 기능 업데이트 (기존 프로젝트용) ─────────────────────────
+    [MenuItem("Tools/Metroidvania/기능 업데이트 적용 (붙을 수 없는 벽·끌림 기믹·저장 지점)")]
+    public static void ApplyFeatureUpdate()
+    {
+        Sprite square = AssetDatabase.LoadAssetAtPath<Sprite>(ArtDir + "/Square.png");
+        Sprite platform = AssetDatabase.LoadAssetAtPath<Sprite>(ArtDir + "/Platform.png");
+        if (square == null || platform == null)
+        {
+            EditorUtility.DisplayDialog("기능 업데이트", "Art 폴더의 스프라이트를 찾지 못했습니다. '프로젝트 초안 생성'을 먼저 실행하세요.", "확인");
+            return;
+        }
+
+        TileSet tiles = CreateTiles(square, platform);   // 새 타일 2종 생성(없을 때) + 저장 지점 타일 갱신
+        CreatePalette(tiles);                              // 기존 팔레트에 빠진 타일 추가
+        AssetDatabase.SaveAssets();
+
+#if UNITY_2023_1_OR_NEWER
+        LevelTilemap lt = Object.FindFirstObjectByType<LevelTilemap>();
+#else
+        LevelTilemap lt = Object.FindObjectOfType<LevelTilemap>();
+#endif
+        string msg = "타일 2종(붙을 수 없는 벽, 끌림)과 팔레트를 업데이트했습니다.";
+        if (lt != null)
+        {
+            Grid grid = lt.GetComponentInParent<Grid>();
+            SetupLevelLayers(grid != null ? grid.transform : lt.transform.parent, lt.Source, tiles);
+            lt.Source.RefreshAllTiles();
+            EditorSceneManager.MarkSceneDirty(lt.gameObject.scene);
+            msg += "\n현재 씬의 Level에 [자동] 레이어 2개를 추가했습니다. 씬을 저장하세요 (Ctrl+S).";
+        }
+        else msg += "\n현재 씬에 Level 타일맵이 없어 레이어는 추가하지 않았습니다.";
+        EditorUtility.DisplayDialog("기능 업데이트", msg, "확인");
     }
 
     // ───────────────────────── 기존 씬 변환 ─────────────────────────
@@ -483,8 +632,8 @@ public static class ProjectBuilder
 
         // 같은 칸에 여러 타일이 겹치면 우선순위 높은 쪽 (가시 > 벽 > 발판 > 저장 > 기류 > 기타)
         System.Func<TileBase, int> priority = tile =>
-            tile == t.spike ? 5 : tile == t.ground ? 4 : tile == t.platform ? 3 :
-            tile == t.savePoint ? 2 : tile == t.updraft ? 1 : 0;
+            tile == t.spike ? 5 : (tile == t.ground || tile == t.noClimb) ? 4 : tile == t.platform ? 3 :
+            tile == t.savePoint ? 2 : (tile == t.updraft || tile == t.pull) ? 1 : 0;
 
         int copied = 0;
         foreach (Tilemap tm in old)
@@ -626,11 +775,77 @@ public static class ProjectBuilder
         return null;
     }
 
+    // ───────────────────────── 자동 설정 (에디터 로드 시) ─────────────────────────
+    /// <summary>새 타일이 없거나 팔레트에 빠져 있으면 만들고, 씬의 Level에 새 레이어가 없으면 연결 여부를 물음</summary>
+    internal static void AutoSetup(bool askScene)
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) return;
+        Sprite square = AssetDatabase.LoadAssetAtPath<Sprite>(ArtDir + "/Square.png");
+        Sprite platform = AssetDatabase.LoadAssetAtPath<Sprite>(ArtDir + "/Platform.png");
+        if (square == null || platform == null) return;          // 아직 초안 생성 전
+
+        TileSet t = LoadTileSet();
+        bool tilesMissing = t.noClimb == null || t.pull == null;
+        if (tilesMissing) t = CreateTiles(square, platform);
+
+        bool paletteChanged = false;
+        foreach (string pal in FindPalettes())
+            if (PaletteMissingTiles(pal, t)) { AddMissingTilesToPalette(pal, t); paletteChanged = true; }
+        if (tilesMissing || paletteChanged)
+        {
+            AssetDatabase.SaveAssets();
+            Debug.Log("[ProjectBuilder] 붙을 수 없는 벽 / 끌림 타일을 팔레트에 추가했습니다.");
+        }
+
+        if (!askScene) return;
+#if UNITY_2023_1_OR_NEWER
+        LevelTilemap lt = Object.FindFirstObjectByType<LevelTilemap>();
+#else
+        LevelTilemap lt = Object.FindObjectOfType<LevelTilemap>();
+#endif
+        if (lt == null) return;
+        bool needsLayers = lt.noClimbLayer == null || lt.pullLayer == null
+                           || lt.noClimbTiles == null || lt.noClimbTiles.Length == 0
+                           || lt.pullTiles == null || lt.pullTiles.Length == 0;
+        if (!needsLayers) return;
+
+        string key = "MV.AskLayers." + lt.gameObject.scene.path;
+        if (SessionState.GetBool(key, false)) return;
+        SessionState.SetBool(key, true);
+
+        if (EditorUtility.DisplayDialog("새 타일 기능 연결",
+            "현재 씬의 Level 타일맵에 '붙을 수 없는 벽'과 '끌림' 기능 레이어가 없습니다.\n" +
+            "지금 연결할까요? (연결하지 않으면 두 타일은 그려져도 기능이 동작하지 않습니다)", "연결", "나중에"))
+        {
+            Grid grid = lt.GetComponentInParent<Grid>();
+            SetupLevelLayers(grid != null ? grid.transform : lt.transform.parent, lt.Source, t);
+            lt.Source.RefreshAllTiles();
+            EditorSceneManager.MarkSceneDirty(lt.gameObject.scene);
+            Debug.Log("[ProjectBuilder] Level에 [자동] 레이어(붙을 수 없는 벽, 끌림)를 추가했습니다. 씬을 저장하세요.");
+        }
+    }
+
     static Color Hex(string hex, float alpha = 1f)
     {
         ColorUtility.TryParseHtmlString("#" + hex, out Color c);
         c.a = alpha;
         return c;
+    }
+}
+
+[InitializeOnLoad]
+static class ProjectBuilderAutoSetup
+{
+    static ProjectBuilderAutoSetup()
+    {
+        EditorApplication.delayCall += () => ProjectBuilder.AutoSetup(true);
+        EditorSceneManager.sceneOpened -= OnSceneOpened;
+        EditorSceneManager.sceneOpened += OnSceneOpened;
+    }
+
+    static void OnSceneOpened(UnityEngine.SceneManagement.Scene scene, OpenSceneMode mode)
+    {
+        EditorApplication.delayCall += () => ProjectBuilder.AutoSetup(true);
     }
 }
 #endif

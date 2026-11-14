@@ -61,6 +61,7 @@ public class EnemyAI : MonoBehaviour
     int facing = 1;
     float cooldownTimer, windupTimer, stunTimer, attackFlashTimer;
     Color bodyBaseColor = Color.white;
+    float appliedPullX;     // 지난 스텝에 더한 끌림 속도 (누적 방지)
 
     void Awake()
     {
@@ -113,10 +114,12 @@ public class EnemyAI : MonoBehaviour
         float dt = Time.fixedDeltaTime;
         cooldownTimer -= dt;
 
-        if (stunTimer > 0f) { stunTimer -= dt; return; }   // 넉백 유지
+        if (stunTimer > 0f) { stunTimer -= dt; appliedPullX = 0f; return; }   // 넉백 유지
         if (player == null) FindPlayer();
 
         Vector2 v = rb.GetVelocity();
+        v.x -= appliedPullX;
+        appliedPullX = 0f;
         bool playerAlive = player != null && (playerHealth == null || !playerHealth.IsDead);
 
         // 예비동작 → 공격
@@ -130,7 +133,7 @@ public class EnemyAI : MonoBehaviour
                 cooldownTimer = attackCooldown;
                 state = State.Chase;
             }
-            rb.SetVelocity(v);
+            ApplyPullAndSet(v);
             return;
         }
 
@@ -169,6 +172,15 @@ public class EnemyAI : MonoBehaviour
                 break;
         }
 
+        ApplyPullAndSet(v);
+    }
+
+    /// <summary>끌림 기믹: 수평 끌림 속도를 더해 적용</summary>
+    void ApplyPullAndSet(Vector2 v)
+    {
+        Vector2 pull = PullTilemap.GetPull(Center);
+        appliedPullX = pull.x;
+        v.x += pull.x;
         rb.SetVelocity(v);
     }
 
@@ -232,6 +244,7 @@ public class EnemyAI : MonoBehaviour
         float dir = Mathf.Sign(rb.position.x - source.x);
         if (dir == 0f) dir = -facing;
         rb.SetVelocity(new Vector2(dir * knockbackVelocity.x, knockbackVelocity.y));
+        appliedPullX = 0f;
         stunTimer = hitStunTime;
         if (hitInterruptsAttack && state == State.Windup) state = State.Chase;
         if (state != State.Windup) state = State.Chase;        // 맞으면 바로 어그로

@@ -8,6 +8,14 @@ public class CameraFollow : MonoBehaviour
 
     Vector3 velocity;
 
+    /// <summary>순간이동 등에서 카메라를 즉시 대상 위치로 옮김</summary>
+    public void Snap()
+    {
+        if (target == null) return;
+        transform.position = new Vector3(target.position.x + offset.x, target.position.y + offset.y, transform.position.z);
+        velocity = Vector3.zero;
+    }
+
     void LateUpdate()
     {
         if (target == null) return;
